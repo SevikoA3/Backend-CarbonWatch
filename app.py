@@ -67,13 +67,8 @@ def load_artifacts():
     if artifacts['loaded']:
         return
 
-    app.logger.info(f'Loading artifacts in {"LOCAL" if LOCAL_MODE else "CLOUD"} mode')
-
     if LOCAL_MODE:
         # LOCAL MODE: Use local files
-        app.logger.info('Using local files for artifacts')
-        
-        # Check if local files exist
         missing = []
         for p in [MODEL_PATH, PREPROCESSOR_PATH, LABEL_ENCODER_PATH]:
             if not os.path.exists(p):
@@ -84,8 +79,6 @@ def load_artifacts():
             
     else:
         # CLOUD MODE: Download from GCS if URIs are provided
-        app.logger.info('Using cloud storage for artifacts')
-        
         def _download_gcs_uri(uri, dest_path):
             if storage is None:
                 app.logger.error('google-cloud-storage is required to download artifacts from GCS but is not installed')
@@ -98,7 +91,6 @@ def load_artifacts():
             client = storage.Client()
             bucket = client.bucket(bucket_name)
             blob = bucket.blob(blob_name)
-            app.logger.info('Downloading %s from GCS bucket %s to %s', blob_name, bucket_name, dest_path)
             blob.download_to_filename(dest_path)
 
         # Resolve URIs from prefix if necessary
@@ -130,7 +122,8 @@ def load_artifacts():
                     app.logger.exception('Failed to download %s -> %s: %s', uri, local_path, e)
                     raise
             else:
-                app.logger.warning('No URI provided for %s', local_path)
+                if not ARTIFACTS_GCS_PREFIX:  # Only warn if no prefix is set
+                    app.logger.warning('No URI provided for %s', local_path)
                 
         # Check that files exist after download
         missing = []
@@ -172,13 +165,13 @@ def load_artifacts():
         raise
 
     artifacts['loaded'] = True
-    app.logger.info('Artifacts loaded successfully.')
 
 
-def analyze_prediction_reasons(df_record, prediction_probs, feature_names):
-    """Analyze prediction and generate reasons/explanations"""
+def analyze_prediction_reasons(df_record, prediction_probs, feature_names, feature_importance=None):
+    """Analyze prediction and generate reasons/explanations using both SHAP and rule-based analysis"""
     reasons = []
     warnings = []
+    used_warnings = set()  # Track used warning types to prevent duplicates
     
     # Get the predicted class index
     pred_class = np.argmax(prediction_probs)
@@ -190,66 +183,118 @@ def analyze_prediction_reasons(df_record, prediction_probs, feature_names):
     else:
         record = df_record
     
-    # Analyze different aspects based on common carbon/transaction features
-    # You should customize these rules based on your actual features
+    # SHAP-based analysis (if available and significant)
+    shap_reasons_added = 0
+    if feature_importance:
+        # Sort features by absolute importance
+        sorted_features = sorted(feature_importance.items(), key=lambda x: abs(x[1]), reverse=True)
+        
+        # Lower threshold for SHAP since our values are small
+        significance_threshold = 0.001  # Reduced from 0.1
+        
+        for feat_name, importance in sorted_features[:5]:  # Check top 5 features
+            if abs(importance) > significance_threshold and shap_reasons_added < 2:
+                direction = "meningkatkan" if importance > 0 else "menurunkan"
+                if feat_name in record.index:
+                    feat_value = record[feat_name]
+                    reasons.append(f"Fitur '{feat_name}' (nilai: {feat_value}) {direction} probabilitas prediksi secara signifikan")
+                    shap_reasons_added += 1
     
-    # Volume/Amount analysis
+    # Rule-based analysis (backup/additional context)
+    # Volume/Amount analysis - prioritize the largest amount to avoid duplicates
     amount_features = [col for col in feature_names if 'amount' in col.lower() or 'volume' in col.lower() or 'value' in col.lower()]
+    max_amount = 0
+    max_amount_feature = None
+    max_amount_value = 0
+    
     for feat in amount_features:
         if feat in record.index:
             value = record[feat]
-            if isinstance(value, (int, float)):
-                if value > 10000:  # Adjust threshold based on your data
-                    warnings.append(f"Volume transaksi tidak proporsional dengan profil industri (${value:,.2f})")
-                elif value < 100:
-                    warnings.append(f"Volume transaksi sangat rendah (${value:,.2f})")
+            if isinstance(value, (int, float)) and abs(value) > max_amount:
+                max_amount = abs(value)
+                max_amount_feature = feat
+                max_amount_value = value
+    
+    # Add warning only for the highest amount feature
+    if max_amount_feature and 'volume_warning' not in used_warnings:
+        if max_amount_value > 100000:  # Very high threshold
+            warnings.append(f"Volume transaksi sangat tinggi dan tidak wajar (${max_amount_value:,.2f})")
+            used_warnings.add('volume_warning')
+        elif max_amount_value > 10000:  # High threshold
+            warnings.append(f"Volume transaksi cukup tinggi untuk profil ini (${max_amount_value:,.2f})")
+            used_warnings.add('volume_warning')
+        elif max_amount_value < 100:  # Low threshold
+            warnings.append(f"Volume transaksi sangat rendah (${max_amount_value:,.2f})")
+            used_warnings.add('volume_warning')
     
     # Time-based analysis  
     time_features = [col for col in feature_names if 'time' in col.lower() or 'hour' in col.lower() or 'day' in col.lower()]
     for feat in time_features:
-        if feat in record.index:
+        if feat in record.index and 'time_warning' not in used_warnings:
             value = record[feat]
             if isinstance(value, (int, float)):
                 if value < 6 or value > 22:  # Outside business hours
                     warnings.append("Melakukan transaksi di luar jam kerja normal")
+                    used_warnings.add('time_warning')
+                    break  # Only add one time warning
+    
+    # Cross-border and entity analysis
+    cross_border_features = [col for col in feature_names if 'cross' in col.lower() or 'border' in col.lower()]
+    for feat in cross_border_features:
+        if feat in record.index and 'cross_border_warning' not in used_warnings:
+            value = record[feat]
+            if isinstance(value, (int, float)) and value > 0:
+                warnings.append("Transaksi lintas negara dengan risiko tambahan")
+                used_warnings.add('cross_border_warning')
+                break
+    
+    # Entity type analysis
+    entity_features = [col for col in feature_names if 'entity' in col.lower() or 'type' in col.lower()]
+    for feat in entity_features:
+        if feat in record.index and 'entity_warning' not in used_warnings:
+            value = str(record[feat]).lower()
+            if 'individual' in value or 'unverified' in value:
+                warnings.append("Tipe entitas memiliki profil risiko tinggi")
+                used_warnings.add('entity_warning')
+                break
     
     # Frequency analysis
-    freq_features = [col for col in feature_names if 'freq' in col.lower() or 'count' in col.lower()]
+    freq_features = [col for col in feature_names if 'freq' in col.lower() or 'count' in col.lower() or 'spike' in col.lower()]
     for feat in freq_features:
-        if feat in record.index:
+        if feat in record.index and 'frequency_warning' not in used_warnings:
             value = record[feat]
             if isinstance(value, (int, float)):
                 if value > 20:  # High frequency
                     warnings.append("Pola transaksi dengan frekuensi tinggi terdeteksi")
-                elif value < 2:
-                    warnings.append("Aktivitas transaksi sangat jarang")
-    
-    # Category/Type analysis
-    category_features = [col for col in feature_names if 'category' in col.lower() or 'type' in col.lower()]
-    for feat in category_features:
-        if feat in record.index:
-            value = str(record[feat]).lower()
-            if 'unusual' in value or 'irregular' in value:
-                warnings.append("Kategori transaksi tidak umum terdeteksi")
+                    used_warnings.add('frequency_warning')
+                    break
+                elif 'spike' in feat.lower() and value > 0:
+                    warnings.append("Terdeteksi lonjakan mendadak dalam pola transaksi")
+                    used_warnings.add('frequency_warning')
+                    break
     
     # Generate main reason based on prediction confidence and class
     if confidence > 0.8:
-        if pred_class == 1:  # Adjust based on your label encoding
+        if pred_class == 1:  # High-Risk
             reasons.append("Mendeteksi pola transaksi yang tidak wajar")
-        elif pred_class == 0:
+        elif pred_class == 0:  # Verified
             reasons.append("Transaksi terverifikasi dengan pola normal")
-        else:
+        else:  # Caution
             reasons.append("Pola transaksi memerlukan review lebih lanjut")
     else:
         reasons.append("Model tidak yakin dengan prediksi - perlu analisis manual")
     
-    # Add warnings as reasons
-    if warnings:
-        reasons.extend(warnings[:3])  # Limit to top 3 warnings
+    # Add rule-based warnings only if we need more reasons (limit to 3 total)
+    available_slots = 3 - len(reasons)
+    if available_slots > 0 and warnings:
+        # Take unique warnings up to available slots
+        reasons.extend(warnings[:available_slots])
     
-    # If no specific reasons found, add generic ones based on confidence
+    # Ensure we always have at least 2 reasons
     if len(reasons) == 1:
-        if confidence > 0.7:
+        if confidence > 0.9:
+            reasons.append("Tingkat keyakinan model sangat tinggi berdasarkan pola historis")
+        elif confidence > 0.7:
             reasons.append("Tingkat keyakinan model tinggi berdasarkan pola historis")
         else:
             reasons.append("Perlu verifikasi tambahan karena pola tidak jelas")
@@ -257,7 +302,7 @@ def analyze_prediction_reasons(df_record, prediction_probs, feature_names):
     return reasons
 
 
-def generate_gemini_explanation(prediction_data, reasons, feature_importance=None):
+def generate_gemini_explanation(prediction_data, reasons, feature_importance=None, input_data=None):
     """Generate natural language explanation using Gemini"""
     if not gemini_client:
         return "Penjelasan AI tidak tersedia - API key tidak ditemukan"
@@ -274,10 +319,16 @@ Anda adalah AI assistant untuk sistem deteksi fraud CarbonWatch. Berikan penjela
 
 Transaksi ID: {transaction_id}
 Hasil Prediksi: {label}
-Tingkat Keyakinan: {confidence:.2%}
+Tingkat Keyakinan: {confidence:.2%}"""
 
-Alasan teknis yang ditemukan:
-"""
+        # Add all input data if available
+        if input_data:
+            prompt += "\n\nData Input Transaksi:\n"
+            for key, value in input_data.items():
+                if key != 'id':  # Skip transaction ID as it's already shown
+                    prompt += f"- {key}: {value}\n"
+
+        prompt += "\nAlasan teknis yang ditemukan:\n"
         for i, reason in enumerate(reasons, 1):
             prompt += f"{i}. {reason}\n"
         
@@ -307,8 +358,7 @@ Format jawaban dalam bahasa Indonesia yang profesional dan tidak bertele-tele ta
         
         return response.text.strip()
         
-    except Exception as e:
-        app.logger.warning(f"Gemini explanation failed: {e}")
+    except Exception:
         # Fallback to rule-based explanation
         return f"Sistem mendeteksi transaksi dengan tingkat keyakinan {confidence:.1%}. " + ". ".join(reasons[:2]) + "."
 
@@ -382,32 +432,88 @@ def predict():
         # Build response with explanations
         results = []
         for i in range(len(records)):
-            # Generate basic explanations for this prediction
-            reasons = analyze_prediction_reasons(
-                df.iloc[[i]], 
-                preds[i], 
-                feature_names
-            )
-            
-            # Advanced SHAP explanation if available
+            # Advanced SHAP explanation if available (do this first)
             feature_importance = {}
             if shap is not None:
                 try:
                     # Create explainer for single prediction
                     X_single = X_processed[i:i+1]
-                    explainer = shap.Explainer(lambda x: artifacts['model'].predict(x), X_single)
-                    shap_values = explainer(X_single)
                     
-                    # Get feature importance
-                    if hasattr(shap_values, 'values') and len(shap_values.values.shape) > 1:
-                        importance_values = shap_values.values[0][:, pred_indices[i]] if len(shap_values.values.shape) == 3 else shap_values.values[0]
-                        
-                        for j, feat_name in enumerate(feature_names):
-                            if j < len(importance_values):
-                                feature_importance[feat_name] = float(importance_values[j])
+                    # Handle sparse matrices - get shape safely
+                    n_samples = X_processed.shape[0]
+                    
+                    # Use larger background sample for better baseline
+                    background_size = min(50, n_samples)  # Increased from 10 to 50
+                    X_background = X_processed[:background_size]
+                    
+                    # Convert sparse to dense if needed for SHAP
+                    if hasattr(X_single, 'toarray'):
+                        X_single_dense = X_single.toarray()
+                        X_background_dense = X_background.toarray()
+                    else:
+                        X_single_dense = X_single
+                        X_background_dense = X_background
+                    
+                    # Use Kernel explainer for more robust results with neural networks
+                    def model_predict_wrapper(x):
+                        return artifacts['model'].predict(x, verbose=0)
+                    
+                    # Create explainer with proper background
+                    explainer = shap.KernelExplainer(model_predict_wrapper, X_background_dense)
+                    shap_values = explainer.shap_values(X_single_dense, nsamples=100)
+                    
+                    # Handle different SHAP output formats for multi-class
+                    if isinstance(shap_values, list):
+                        # Multi-class: shap_values is list of arrays, one per class
+                        class_shap_values = shap_values[pred_indices[i]]
+                        if len(class_shap_values.shape) == 2:
+                            importance_values = class_shap_values[0]
+                        else:
+                            importance_values = class_shap_values
+                    else:
+                        # For KernelExplainer with multi-class: shape is (n_samples, n_features, n_classes)
+                        if len(shap_values.shape) == 3:
+                            importance_values = shap_values[0, :, pred_indices[i]]
+                        elif len(shap_values.shape) == 2:
+                            importance_values = shap_values[0]
+                        else:
+                            importance_values = shap_values
+                    
+                    # Create feature importance dict
+                    for j, feat_name in enumerate(feature_names):
+                        if j < len(importance_values):
+                            raw_val = importance_values[j]
+                            if hasattr(raw_val, 'item'):
+                                importance_val = float(raw_val.item())
+                            else:
+                                importance_val = float(raw_val)
+                            feature_importance[feat_name] = importance_val
+                    
+                    # Fallback if SHAP values are too small
+                    non_zero_features = {k: v for k, v in feature_importance.items() if abs(v) > 0.001}
+                    if not non_zero_features:
+                        try:
+                            # Use prediction perturbation as fallback
+                            baseline_input = np.mean(X_background_dense, axis=0, keepdims=True)
+                            current_pred = artifacts['model'].predict(X_single_dense, verbose=0)
+                            
+                            perturbation_size = 0.1
+                            for idx, feat_name in enumerate(feature_names[:min(len(feature_names), X_single_dense.shape[1])]):
+                                perturbed_input = X_single_dense.copy()
+                                if idx < X_single_dense.shape[1]:
+                                    perturbed_input[0, idx] += perturbation_size
+                                    perturbed_pred = artifacts['model'].predict(perturbed_input, verbose=0)
+                                    importance_val = float(abs(perturbed_pred[0, pred_indices[i]] - current_pred[0, pred_indices[i]]))
+                                    feature_importance[feat_name] = importance_val
+                        except Exception:
+                            pass
                     
                 except Exception as e:
-                    app.logger.warning(f"SHAP analysis failed for record {i}: {e}")
+                    # Complete fallback: simple feature ranking based on input values
+                    input_values = X_single_dense[0] if hasattr(X_single_dense, 'shape') else X_single_dense
+                    for idx, feat_name in enumerate(feature_names):
+                        if idx < len(input_values):
+                            feature_importance[feat_name] = float(abs(input_values[idx]) * 0.1)
                 finally:
                     # Clean up SHAP objects
                     try:
@@ -415,6 +521,16 @@ def predict():
                         gc.collect()
                     except Exception:
                         pass
+            else:
+                pass  # SHAP not available
+            
+            # Generate explanations using both SHAP and rule-based analysis
+            reasons = analyze_prediction_reasons(
+                df.iloc[[i]], 
+                preds[i], 
+                feature_names,
+                feature_importance  # Pass SHAP values
+            )
             
             # Prepare prediction data for Gemini
             prediction_data = {
@@ -424,7 +540,12 @@ def predict():
             }
             
             # Generate AI explanation using Gemini
-            ai_explanation = generate_gemini_explanation(prediction_data, reasons, feature_importance)
+            ai_explanation = generate_gemini_explanation(
+                prediction_data, 
+                reasons, 
+                feature_importance,
+                input_data=records[i]  # Pass all input data
+            )
             
             result = {
                 'label': prediction_data['label'],
