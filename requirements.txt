@@ -4,3 +4,7 @@ numpy
 scikit-learn
 tensorflow
 gunicorn
+google-cloud-storage
+shap
+python-dotenv
+google-genai
