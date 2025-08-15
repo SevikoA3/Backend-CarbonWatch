@@ -189,89 +189,170 @@ def analyze_prediction_reasons(df_record, prediction_probs, feature_names, featu
         # Sort features by absolute importance
         sorted_features = sorted(feature_importance.items(), key=lambda x: abs(x[1]), reverse=True)
         
-        # Lower threshold for SHAP since our values are small
-        significance_threshold = 0.001  # Reduced from 0.1
+        # Use relative threshold - only take features in top 30% of importance
+        all_importances = [abs(v) for v in feature_importance.values() if v != 0]
+        if all_importances and len(all_importances) > 1:
+            significance_threshold = np.percentile(all_importances, 70)  # Top 30% of features
+        else:
+            significance_threshold = 0
         
         for feat_name, importance in sorted_features[:5]:  # Check top 5 features
-            if abs(importance) > significance_threshold and shap_reasons_added < 2:
+            if abs(importance) > significance_threshold and shap_reasons_added < 3:  # Allow up to 3 SHAP reasons
                 direction = "meningkatkan" if importance > 0 else "menurunkan"
                 if feat_name in record.index:
                     feat_value = record[feat_name]
                     reasons.append(f"Fitur '{feat_name}' (nilai: {feat_value}) {direction} probabilitas prediksi secara signifikan")
                     shap_reasons_added += 1
     
-    # Rule-based analysis (backup/additional context)
-    # Volume/Amount analysis - prioritize the largest amount to avoid duplicates
-    amount_features = [col for col in feature_names if 'amount' in col.lower() or 'volume' in col.lower() or 'value' in col.lower()]
-    max_amount = 0
-    max_amount_feature = None
-    max_amount_value = 0
+    # Rule-based analysis (backup/additional context) - Refactored for all categories
+    def get_importance_threshold(feature_importance):
+        """Calculate dynamic importance threshold"""
+        if not feature_importance:
+            return 0
+        all_importances = [abs(v) for v in feature_importance.values() if v != 0]
+        if all_importances and len(all_importances) > 2:
+            return np.percentile(all_importances, 50)  # Top 50% of features
+        return 0
     
-    for feat in amount_features:
-        if feat in record.index:
-            value = record[feat]
-            if isinstance(value, (int, float)) and abs(value) > max_amount:
-                max_amount = abs(value)
-                max_amount_feature = feat
-                max_amount_value = value
+    def add_feature_warning(category_features, warning_type, message_template, used_warnings):
+        """Generic function to add feature warnings based on importance"""
+        if warning_type in used_warnings:
+            return
+            
+        importance_threshold = get_importance_threshold(feature_importance)
+        
+        for feat in category_features:
+            if feat in feature_names and feat in record.index:
+                value = record[feat]
+                feat_importance = feature_importance.get(feat, 0) if feature_importance else 0
+                
+                if abs(feat_importance) > importance_threshold:
+                    message = message_template.format(feat=feat, value=value)
+                    warnings.append(message)
+                    used_warnings.add(warning_type)
+                    return  # Only add one warning per category
     
-    # Add warning only for the highest amount feature
-    if max_amount_feature and 'volume_warning' not in used_warnings:
-        if max_amount_value > 100000:  # Very high threshold
-            warnings.append(f"Volume transaksi sangat tinggi dan tidak wajar (${max_amount_value:,.2f})")
-            used_warnings.add('volume_warning')
-        elif max_amount_value > 10000:  # High threshold
-            warnings.append(f"Volume transaksi cukup tinggi untuk profil ini (${max_amount_value:,.2f})")
-            used_warnings.add('volume_warning')
-        elif max_amount_value < 100:  # Low threshold
-            warnings.append(f"Volume transaksi sangat rendah (${max_amount_value:,.2f})")
-            used_warnings.add('volume_warning')
+    # Define all feature categories and their message templates
+    feature_categories = [
+        # Volume/Amount analysis - special handling for max value
+        {
+            'features': [col for col in feature_names if 'amount' in col.lower() or 'volume' in col.lower() or 'value' in col.lower()],
+            'warning_type': 'volume_warning',
+            'handler': 'special_volume'  # Special handling
+        },
+        # Time-based analysis
+        {
+            'features': [col for col in feature_names if 'time' in col.lower() or 'hour' in col.lower() or 'day' in col.lower()],
+            'warning_type': 'time_warning',
+            'template': 'Pola waktu transaksi ({feat}: {value}) mempengaruhi prediksi'
+        },
+        # Cross-border analysis
+        {
+            'features': [col for col in feature_names if 'cross' in col.lower() or 'border' in col.lower() or 'flag' in col.lower()],
+            'warning_type': 'cross_border_warning',
+            'template': 'Faktor {feat} berkontribusi pada tingkat risiko transaksi'
+        },
+        # Entity type analysis
+        {
+            'features': [col for col in feature_names if 'entity' in col.lower() or 'type' in col.lower()],
+            'warning_type': 'entity_warning',
+            'template': 'Jenis entitas ({feat}: {value}) berpengaruh pada prediksi'
+        },
+        # Frequency analysis
+        {
+            'features': [col for col in feature_names if 'freq' in col.lower() or 'count' in col.lower() or 'spike' in col.lower()],
+            'warning_type': 'frequency_warning',
+            'handler': 'special_frequency'  # Special handling for spike detection
+        },
+        # Price analysis
+        {
+            'features': [col for col in feature_names if 'price' in col.lower() or 'rate' in col.lower() or 'ton' in col.lower()],
+            'warning_type': 'price_warning',
+            'template': 'Harga per unit ({feat}: ${value:,.2f}) berpengaruh pada tingkat risiko'
+        },
+        # Industry analysis
+        {
+            'features': [col for col in feature_names if 'industry' in col.lower() or 'sector' in col.lower() or 'business' in col.lower()],
+            'warning_type': 'industry_warning',
+            'template': 'Sektor industri ({feat}: {value}) mempengaruhi analisis risiko'
+        },
+        # Location analysis
+        {
+            'features': [col for col in feature_names if 'country' in col.lower() or 'location' in col.lower() or 'origin' in col.lower() or 'destination' in col.lower()],
+            'warning_type': 'location_warning',
+            'handler': 'special_location'  # Special handling for unknown values
+        }
+    ]
     
-    # Time-based analysis  
-    time_features = [col for col in feature_names if 'time' in col.lower() or 'hour' in col.lower() or 'day' in col.lower()]
-    for feat in time_features:
-        if feat in record.index and 'time_warning' not in used_warnings:
-            value = record[feat]
-            if isinstance(value, (int, float)):
-                if value < 6 or value > 22:  # Outside business hours
-                    warnings.append("Melakukan transaksi di luar jam kerja normal")
-                    used_warnings.add('time_warning')
-                    break  # Only add one time warning
-    
-    # Cross-border and entity analysis
-    cross_border_features = [col for col in feature_names if 'cross' in col.lower() or 'border' in col.lower()]
-    for feat in cross_border_features:
-        if feat in record.index and 'cross_border_warning' not in used_warnings:
-            value = record[feat]
-            if isinstance(value, (int, float)) and value > 0:
-                warnings.append("Transaksi lintas negara dengan risiko tambahan")
-                used_warnings.add('cross_border_warning')
-                break
-    
-    # Entity type analysis
-    entity_features = [col for col in feature_names if 'entity' in col.lower() or 'type' in col.lower()]
-    for feat in entity_features:
-        if feat in record.index and 'entity_warning' not in used_warnings:
-            value = str(record[feat]).lower()
-            if 'individual' in value or 'unverified' in value:
-                warnings.append("Tipe entitas memiliki profil risiko tinggi")
-                used_warnings.add('entity_warning')
-                break
-    
-    # Frequency analysis
-    freq_features = [col for col in feature_names if 'freq' in col.lower() or 'count' in col.lower() or 'spike' in col.lower()]
-    for feat in freq_features:
-        if feat in record.index and 'frequency_warning' not in used_warnings:
-            value = record[feat]
-            if isinstance(value, (int, float)):
-                if value > 20:  # High frequency
-                    warnings.append("Pola transaksi dengan frekuensi tinggi terdeteksi")
-                    used_warnings.add('frequency_warning')
-                    break
-                elif 'spike' in feat.lower() and value > 0:
-                    warnings.append("Terdeteksi lonjakan mendadak dalam pola transaksi")
-                    used_warnings.add('frequency_warning')
-                    break
+    # Process all categories
+    for category in feature_categories:
+        if category['warning_type'] in used_warnings:
+            continue
+            
+        # Special handlers for complex logic
+        if category.get('handler') == 'special_volume':
+            # Volume/Amount analysis - prioritize the largest amount to avoid duplicates
+            max_amount = 0
+            max_amount_feature = None
+            max_amount_value = 0
+            
+            for feat in category['features']:
+                if feat in record.index:
+                    value = record[feat]
+                    if isinstance(value, (int, float)) and abs(value) > max_amount:
+                        max_amount = abs(value)
+                        max_amount_feature = feat
+                        max_amount_value = value
+            
+            if max_amount_feature:
+                feat_importance = feature_importance.get(max_amount_feature, 0) if feature_importance else 0
+                importance_threshold = get_importance_threshold(feature_importance)
+                
+                if abs(feat_importance) > importance_threshold:
+                    direction = "meningkatkan" if feat_importance > 0 else "menurunkan"
+                    warnings.append(f"Volume {max_amount_feature} (${max_amount_value:,.2f}) berkontribusi {direction} risiko")
+                    used_warnings.add('volume_warning')
+                elif max_amount_value != 0:  # Fallback if no SHAP
+                    warnings.append(f"Volume {max_amount_feature}: ${max_amount_value:,.2f}")
+                    used_warnings.add('volume_warning')
+                    
+        elif category.get('handler') == 'special_frequency':
+            # Frequency analysis with spike detection
+            importance_threshold = get_importance_threshold(feature_importance)
+            
+            for feat in category['features']:
+                if feat in record.index:
+                    value = record[feat]
+                    feat_importance = feature_importance.get(feat, 0) if feature_importance else 0
+                    
+                    if isinstance(value, (int, float)) and abs(feat_importance) > importance_threshold:
+                        if 'spike' in feat.lower() and value > 0:
+                            warnings.append(f"Terdeteksi anomali pada pola frekuensi transaksi ({feat}: {value})")
+                        else:
+                            warnings.append(f"Pola frekuensi ({feat}: {value}) mempengaruhi tingkat risiko")
+                        used_warnings.add('frequency_warning')
+                        break
+                        
+        elif category.get('handler') == 'special_location':
+            # Location analysis with unknown value handling
+            importance_threshold = get_importance_threshold(feature_importance)
+            
+            for feat in category['features']:
+                if feat in record.index:
+                    value = record[feat]
+                    feat_importance = feature_importance.get(feat, 0) if feature_importance else 0
+                    
+                    if abs(feat_importance) > importance_threshold:
+                        if isinstance(value, str) and value.lower() != 'unknown':
+                            warnings.append(f"Lokasi transaksi ({feat}: {value}) berpengaruh pada prediksi")
+                        else:
+                            warnings.append(f"Data lokasi tidak lengkap ({feat}) mempengaruhi analisis")
+                        used_warnings.add('location_warning')
+                        break
+                        
+        else:
+            # Standard template-based processing
+            add_feature_warning(category['features'], category['warning_type'], category['template'], used_warnings)
     
     # Generate main reason based on prediction confidence and class
     if confidence > 0.8:
@@ -284,8 +365,8 @@ def analyze_prediction_reasons(df_record, prediction_probs, feature_names, featu
     else:
         reasons.append("Model tidak yakin dengan prediksi - perlu analisis manual")
     
-    # Add rule-based warnings only if we need more reasons (limit to 3 total)
-    available_slots = 3 - len(reasons)
+    # Add rule-based warnings only if we need more reasons (limit to 4 total)
+    available_slots = 4 - len(reasons)
     if available_slots > 0 and warnings:
         # Take unique warnings up to available slots
         reasons.extend(warnings[:available_slots])
