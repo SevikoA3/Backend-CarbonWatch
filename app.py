@@ -435,10 +435,6 @@ def predict():
                     'ai_summary': ai_explanation,
                     'technical_reasons': reasons,
                     'feature_importance': feature_importance if feature_importance else {},
-                    'risk_assessment': {
-                        'level': 'HIGH' if confidences[i] > 0.8 and pred_indices[i] == 0 else 'MEDIUM' if confidences[i] < 0.6 else 'LOW',
-                        'recommendation': 'Perlu investigasi lebih lanjut' if confidences[i] > 0.8 and pred_indices[i] == 0 else 'Transaksi dapat diproses'
-                    }
                 }
             }
             results.append(result)
