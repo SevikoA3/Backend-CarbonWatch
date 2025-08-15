@@ -6,3 +6,5 @@ tensorflow
 gunicorn
 google-cloud-storage
 shap
+python-dotenv
+google-genai

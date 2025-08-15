@@ -1,25 +1,10 @@
-"""Flask backend for CarbonWatch model predictions
-Endpoint:
-  POST /predict  -> accepts JSON body with a single record or list of records (feature names must match training CSV columns excluding 'Label')
-
-Example request bodies:
-  {"feature1": 1.2, "feature2": "A", ...}
-  {"instances": [{...}, {...}]}
-
-Response:
-  {"predictions": [{"label": "Verified", "confidence": 0.93, "probabilities": [0.93, 0.05, 0.02]}, ...]}
-
-Notes:
-  - Model and preprocessing artifacts are loaded from ../ML relative to this file.
-  - Make sure the files `carbon_watch_model.keras`, `preprocessor.pkl`, and `label_encoder.pkl` exist in the ML/ folder.
-"""
-
 import os
 import pickle
 import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify
 from urllib.parse import urlparse
+import gc
 
 # Lazy imports for heavy libs
 try:
@@ -32,6 +17,17 @@ try:
     import shap
 except Exception:
     shap = None
+
+# Optional Gemini for natural language explanations
+try:
+    from google import genai
+    GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+    if GEMINI_API_KEY:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    else:
+        gemini_client = None
+except Exception:
+    gemini_client = None
 
 # Optional GCS client (used when MODEL_GCS_URI etc. are provided)
 try:
@@ -261,6 +257,62 @@ def analyze_prediction_reasons(df_record, prediction_probs, feature_names):
     return reasons
 
 
+def generate_gemini_explanation(prediction_data, reasons, feature_importance=None):
+    """Generate natural language explanation using Gemini"""
+    if not gemini_client:
+        return "Penjelasan AI tidak tersedia - API key tidak ditemukan"
+    
+    try:
+        # Prepare context for Gemini
+        label = prediction_data['label']
+        confidence = prediction_data['confidence']
+        transaction_id = prediction_data.get('transaction_id', 'Unknown')
+        
+        # Build prompt for Gemini
+        prompt = f"""
+Anda adalah AI assistant untuk sistem deteksi fraud CarbonWatch. Berikan penjelasan dalam Bahasa Indonesia yang mudah dipahami tentang hasil prediksi berikut:
+
+Transaksi ID: {transaction_id}
+Hasil Prediksi: {label}
+Tingkat Keyakinan: {confidence:.2%}
+
+Alasan teknis yang ditemukan:
+"""
+        for i, reason in enumerate(reasons, 1):
+            prompt += f"{i}. {reason}\n"
+        
+        if feature_importance:
+            prompt += "\nFitur yang paling berpengaruh:\n"
+            sorted_features = sorted(feature_importance.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+            for feat, importance in sorted_features:
+                prompt += f"- {feat}: {importance:.3f}\n"
+        
+        prompt += """
+Tugas Anda:
+1. Jelaskan hasil prediksi dengan bahasa yang mudah dipahami
+2. Berikan rekomendasi tindakan yang jelas
+3. Sebutkan tingkat risiko dan alasannya
+4. Gunakan maksimal 3-4 kalimat yang informatif
+5. Jawaban tidak perlu menggunakan formatting seperti bold, italic, dan lain-lain
+6. Tuliskan penjelasan tanpa menggunakan kata ganti orang pertama (mis. "kami", "saya")
+
+Format jawaban dalam bahasa Indonesia yang profesional dan tidak bertele-tele tapi mudah dipahami.
+"""
+        
+        # Call Gemini API
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        
+        return response.text.strip()
+        
+    except Exception as e:
+        app.logger.warning(f"Gemini explanation failed: {e}")
+        # Fallback to rule-based explanation
+        return f"Sistem mendeteksi transaksi dengan tingkat keyakinan {confidence:.1%}. " + ". ".join(reasons[:2]) + "."
+
+
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({
@@ -330,22 +382,63 @@ def predict():
         # Build response with explanations
         results = []
         for i in range(len(records)):
-            # Generate explanations for this prediction
+            # Generate basic explanations for this prediction
             reasons = analyze_prediction_reasons(
                 df.iloc[[i]], 
                 preds[i], 
                 feature_names
             )
             
-            result = {
+            # Advanced SHAP explanation if available
+            feature_importance = {}
+            if shap is not None:
+                try:
+                    # Create explainer for single prediction
+                    X_single = X_processed[i:i+1]
+                    explainer = shap.Explainer(lambda x: artifacts['model'].predict(x), X_single)
+                    shap_values = explainer(X_single)
+                    
+                    # Get feature importance
+                    if hasattr(shap_values, 'values') and len(shap_values.values.shape) > 1:
+                        importance_values = shap_values.values[0][:, pred_indices[i]] if len(shap_values.values.shape) == 3 else shap_values.values[0]
+                        
+                        for j, feat_name in enumerate(feature_names):
+                            if j < len(importance_values):
+                                feature_importance[feat_name] = float(importance_values[j])
+                    
+                except Exception as e:
+                    app.logger.warning(f"SHAP analysis failed for record {i}: {e}")
+                finally:
+                    # Clean up SHAP objects
+                    try:
+                        del shap_values, explainer
+                        gc.collect()
+                    except Exception:
+                        pass
+            
+            # Prepare prediction data for Gemini
+            prediction_data = {
                 'label': str(labels[i]),
                 'confidence': float(confidences[i]),
+                'transaction_id': records[i].get('id', f'TRP{20250000 + i + 1}')
+            }
+            
+            # Generate AI explanation using Gemini
+            ai_explanation = generate_gemini_explanation(prediction_data, reasons, feature_importance)
+            
+            result = {
+                'label': prediction_data['label'],
+                'confidence': prediction_data['confidence'],
                 'probabilities': [float(x) for x in preds[i].tolist()],
-                'reasons': reasons,
-                'transaction_id': records[i].get('id', f'TRP{20250000 + i + 1}'),  # Generate ID if not provided
-                'analysis': {
-                    'risk_level': 'HIGH' if confidences[i] > 0.8 and pred_indices[i] == 0 else 'MEDIUM' if confidences[i] < 0.6 else 'LOW',
-                    'recommendation': 'Perlu investigasi lebih lanjut' if confidences[i] > 0.8 and pred_indices[i] == 0 else 'Transaksi dapat diproses'
+                'transaction_id': prediction_data['transaction_id'],
+                'explanation': {
+                    'ai_summary': ai_explanation,
+                    'technical_reasons': reasons,
+                    'feature_importance': feature_importance if feature_importance else {},
+                    'risk_assessment': {
+                        'level': 'HIGH' if confidences[i] > 0.8 and pred_indices[i] == 0 else 'MEDIUM' if confidences[i] < 0.6 else 'LOW',
+                        'recommendation': 'Perlu investigasi lebih lanjut' if confidences[i] > 0.8 and pred_indices[i] == 0 else 'Transaksi dapat diproses'
+                    }
                 }
             }
             results.append(result)
@@ -355,108 +448,6 @@ def predict():
     except Exception as e:
         app.logger.exception('Prediction error: %s', e)
         return jsonify({'error': 'Prediction failed', 'details': str(e)}), 500
-
-
-@app.route('/explain', methods=['POST'])
-def explain_prediction():
-    """Enhanced explanation endpoint with SHAP analysis if available"""
-    try:
-        if not artifacts['loaded']:
-            load_artifacts()
-        if not artifacts['loaded']:
-            return jsonify({'error': 'Model artifacts are missing on server. Check logs.'}), 500
-
-        data = request.get_json(force=True)
-        
-        # Normalize input into single record
-        if isinstance(data, dict) and 'instances' in data:
-            record = data['instances'][0] if data['instances'] else {}
-        elif isinstance(data, list):
-            record = data[0] if data else {}
-        elif isinstance(data, dict):
-            record = data
-        else:
-            return jsonify({'error': 'Send a single record for detailed explanation'}), 400
-
-        # Build DataFrame
-        df = pd.DataFrame([record])
-        
-        # Transform features
-        preprocessor = artifacts['preprocessor']
-        X_processed = preprocessor.transform(df)
-        
-        # Predict
-        model = artifacts['model']
-        preds = model.predict(X_processed)
-        pred_idx = np.argmax(preds[0])
-        confidence = np.max(preds[0])
-        
-        # Decode label
-        le = artifacts['label_encoder']
-        try:
-            label = le.inverse_transform([pred_idx])[0]
-        except Exception:
-            label = str(int(pred_idx))
-        
-        # Get basic reasons
-        reasons = analyze_prediction_reasons(df, preds[0], df.columns.tolist())
-        
-        # Advanced SHAP explanation if available
-        feature_importance = {}
-        shap_explanation = None
-        
-        if shap is not None:
-            try:
-                # Create explainer (you might want to cache this)
-                explainer = shap.Explainer(lambda x: artifacts['model'].predict(x), X_processed[:1])
-                shap_values = explainer(X_processed[:1])
-                
-                # Get feature importance
-                if hasattr(shap_values, 'values') and len(shap_values.values.shape) > 1:
-                    importance_values = shap_values.values[0][:, pred_idx] if len(shap_values.values.shape) == 3 else shap_values.values[0]
-                    feature_names = df.columns.tolist()
-                    
-                    for i, feat_name in enumerate(feature_names):
-                        if i < len(importance_values):
-                            feature_importance[feat_name] = float(importance_values[i])
-                
-                shap_explanation = "SHAP analysis completed - features ranked by importance"
-            except Exception as e:
-                app.logger.warning(f"SHAP analysis failed: {e}")
-                shap_explanation = "SHAP analysis unavailable"
-        
-        # Enhanced response
-        response = {
-            'prediction': {
-                'label': str(label),
-                'confidence': float(confidence),
-                'probabilities': [float(x) for x in preds[0].tolist()],
-                'transaction_id': record.get('id', f'TRP{20250001}')
-            },
-            'explanation': {
-                'main_reasons': reasons,
-                'feature_importance': feature_importance,
-                'shap_analysis': shap_explanation,
-                'risk_assessment': {
-                    'level': 'HIGH' if confidence > 0.8 and pred_idx == 0 else 'MEDIUM' if confidence < 0.6 else 'LOW',
-                    'score': float(confidence),
-                    'recommendation': 'Perlu investigasi segera' if confidence > 0.9 and pred_idx == 0 
-                                   else 'Monitoring diperlukan' if confidence > 0.7 and pred_idx == 0
-                                   else 'Transaksi dapat diproses normal'
-                }
-            },
-            'input_analysis': {
-                'features_analyzed': len(df.columns),
-                'suspicious_patterns': len([r for r in reasons if any(word in r.lower() for word in ['tidak', 'tinggi', 'rendah', 'luar'])]),
-                'data_quality': 'Good' if not df.isnull().any().any() else 'Has missing values'
-            }
-        }
-        
-        return jsonify(response)
-
-    except Exception as e:
-        app.logger.exception('Explanation error: %s', e)
-        return jsonify({'error': 'Explanation failed', 'details': str(e)}), 500
 
 
 if __name__ == '__main__':
