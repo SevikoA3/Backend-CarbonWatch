@@ -5,6 +5,16 @@ import pandas as pd
 from flask import Flask, request, jsonify
 from urllib.parse import urlparse
 import gc
+from supabase import create_client, Client
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
+from sklearn.compose import make_column_transformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import make_pipeline
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Lazy imports for heavy libs
 try:
@@ -60,6 +70,226 @@ artifacts = {
     'label_encoder': None,
     'loaded': False,
 }
+
+# Supabase configuration
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+
+def get_supabase_client():
+    """Get Supabase client"""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables must be set")
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def upload_artifacts_to_cloud():
+    """Upload trained model artifacts to Google Cloud Storage"""
+    if storage is None:
+        raise RuntimeError('google-cloud-storage is required to upload artifacts to GCS but is not installed')
+    
+    print("\n--- Uploading artifacts to Google Cloud Storage ---")
+    
+    # Define upload tasks
+    upload_tasks = []
+    
+    # Determine URIs for upload
+    if MODEL_GCS_URI:
+        upload_tasks.append((MODEL_PATH, MODEL_GCS_URI))
+    elif ARTIFACTS_GCS_PREFIX:
+        model_uri = f"{ARTIFACTS_GCS_PREFIX.rstrip('/')}/carbon_watch_model.keras"
+        upload_tasks.append((MODEL_PATH, model_uri))
+    
+    if PREPROCESSOR_GCS_URI:
+        upload_tasks.append((PREPROCESSOR_PATH, PREPROCESSOR_GCS_URI))
+    elif ARTIFACTS_GCS_PREFIX:
+        preprocessor_uri = f"{ARTIFACTS_GCS_PREFIX.rstrip('/')}/preprocessor.pkl"
+        upload_tasks.append((PREPROCESSOR_PATH, preprocessor_uri))
+    
+    if LABEL_ENCODER_GCS_URI:
+        upload_tasks.append((LABEL_ENCODER_PATH, LABEL_ENCODER_GCS_URI))
+    elif ARTIFACTS_GCS_PREFIX:
+        label_encoder_uri = f"{ARTIFACTS_GCS_PREFIX.rstrip('/')}/label_encoder.pkl"
+        upload_tasks.append((LABEL_ENCODER_PATH, label_encoder_uri))
+    
+    if not upload_tasks:
+        raise ValueError("No GCS URIs configured for upload. Set MODEL_GCS_URI, PREPROCESSOR_GCS_URI, LABEL_ENCODER_GCS_URI, or ARTIFACTS_GCS_PREFIX")
+    
+    # Upload each file
+    client = storage.Client()
+    uploaded_paths = {}
+    
+    for local_path, gcs_uri in upload_tasks:
+        try:
+            # Parse GCS URI
+            parsed = urlparse(gcs_uri)
+            if parsed.scheme != 'gs':
+                raise ValueError(f'GCS URI must start with gs://, got: {gcs_uri}')
+            
+            bucket_name = parsed.netloc
+            blob_name = parsed.path.lstrip('/')
+            
+            # Upload file
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            
+            print(f"Uploading {local_path} -> {gcs_uri}")
+            blob.upload_from_filename(local_path)
+            
+            # Store successful upload
+            uploaded_paths[local_path] = gcs_uri
+            print(f"✅ Successfully uploaded {local_path}")
+            
+        except Exception as e:
+            print(f"❌ Failed to upload {local_path} to {gcs_uri}: {e}")
+            raise
+    
+    print("--- Cloud upload completed ---")
+    return uploaded_paths
+
+def cleanup_local_artifacts():
+    """Clean up local artifact files after successful cloud upload"""
+    files_to_clean = [MODEL_PATH, PREPROCESSOR_PATH, LABEL_ENCODER_PATH]
+    
+    for file_path in files_to_clean:
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                print(f"🗑️  Cleaned up local file: {file_path}")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not remove {file_path}: {e}")
+
+def load_and_clean_data_from_supabase():
+    """Load dataset from Supabase transaction table and clean the data"""
+    print("\n--- Loading data from Supabase ---")
+    
+    try:
+        supabase = get_supabase_client()
+        
+        # Fetch all transactions from the table
+        response = supabase.table('transaction').select('*').execute()
+        
+        if not response.data:
+            raise ValueError("No data found in transaction table")
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(response.data)
+        print(f"Loaded {len(df)} records from Supabase")
+        
+        # Check for required columns - adapt column names as needed
+        required_columns = [
+            'Transaction Amount', 'Carbon Volume', 'Price per Ton', 'Origin Country',
+            'Cross-Border Flag', 'Buyer Industry', 'Sudden Transaction Spike',
+            'Transaction Hour', 'Entity Type', 'Label'
+        ]
+        
+        # Map possible column variations (adjust based on your actual Supabase table schema)
+        column_mapping = {
+            'transaction_amount': 'Transaction Amount',
+            'carbon_volume': 'Carbon Volume', 
+            'price_per_ton': 'Price per Ton',
+            'origin_country': 'Origin Country',
+            'cross_border_flag': 'Cross-Border Flag',
+            'buyer_industry': 'Buyer Industry',
+            'sudden_transaction_spike': 'Sudden Transaction Spike',
+            'transaction_hour': 'Transaction Hour',
+            'entity_type': 'Entity Type',
+            'label': 'Label'
+        }
+        
+        # Rename columns to match expected format
+        df = df.rename(columns=column_mapping)
+        
+        # Check if we have all required columns after mapping
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
+        
+        # Handle inconsistencies (e.g., 'PT.' to 'PT')
+        if 'Entity Type' in df.columns:
+            df['Entity Type'] = df['Entity Type'].astype(str).str.replace('.', '', regex=False)
+        
+        # Imputation for numeric missing values
+        numeric_cols = df.select_dtypes(include=np.number).columns
+        if len(numeric_cols) > 0:
+            imputer_numeric = SimpleImputer(strategy='median')
+            df[numeric_cols] = imputer_numeric.fit_transform(df[numeric_cols])
+            print("Numeric missing values filled with median")
+        
+        # Imputation for categorical missing values  
+        categorical_cols = df.select_dtypes(include='object').columns.drop('Label', errors='ignore')
+        if len(categorical_cols) > 0:
+            imputer_categorical = SimpleImputer(strategy='most_frequent')
+            df[categorical_cols] = imputer_categorical.fit_transform(df[categorical_cols])
+            print("Categorical missing values filled with mode")
+        
+        print("--- Data cleaning completed ---")
+        return df
+        
+    except Exception as e:
+        print(f"Error loading data from Supabase: {e}")
+        raise
+
+def preprocess_training_data(df):
+    """Preprocess data for training"""
+    print("\n--- Starting data preprocessing ---")
+    
+    # Select features and target
+    feature_cols = [
+        'Transaction Amount', 'Carbon Volume', 'Price per Ton', 'Origin Country',
+        'Cross-Border Flag', 'Buyer Industry', 'Sudden Transaction Spike',
+        'Transaction Hour', 'Entity Type'
+    ]
+    
+    # Check if all feature columns exist
+    missing_cols = [c for c in feature_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing expected feature columns: {missing_cols}")
+        
+    X = df[feature_cols]
+    y = df['Label']
+    
+    # Encode target labels
+    label_encoder = LabelEncoder()
+    y_encoded = label_encoder.fit_transform(y)
+    # Convert to categorical for TensorFlow
+    y_categorical = tf.keras.utils.to_categorical(y_encoded)
+    
+    # Setup preprocessing transformers
+    numeric_features = X.select_dtypes(include=np.number).columns
+    categorical_features = X.select_dtypes(include=['object', 'bool']).columns
+    
+    preprocessor = make_column_transformer(
+        (StandardScaler(), numeric_features),
+        (OneHotEncoder(handle_unknown='ignore'), categorical_features)
+    )
+    
+    print("Numeric features will be scaled, categorical features will be encoded")
+    print("--- Preprocessing completed ---")
+    
+    return X, y_categorical, preprocessor, label_encoder
+
+def build_training_model(input_shape):
+    """Build neural network model for training"""
+    print("\n--- Building neural network model ---")
+    
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(input_shape,)),
+        tf.keras.layers.Dense(128, activation='relu'),
+        tf.keras.layers.Dropout(0.4),
+        tf.keras.layers.Dense(64, activation='relu'),
+        tf.keras.layers.Dropout(0.3),
+        tf.keras.layers.Dense(32, activation='relu'),
+        tf.keras.layers.Dense(3, activation='softmax')  # 3 classes: Verified, Caution, High-Risk
+    ])
+    
+    # Compile model
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    print("Model architecture created and compiled")
+    return model
 
 def load_artifacts():
     """Load model and preprocessing artifacts into memory."""
@@ -442,6 +672,188 @@ Format jawaban dalam bahasa Indonesia yang profesional dan tidak bertele-tele ta
     except Exception:
         # Fallback to rule-based explanation
         return f"Sistem mendeteksi transaksi dengan tingkat keyakinan {confidence:.1%}. " + ". ".join(reasons[:2]) + "."
+
+
+@app.route('/train', methods=['POST'])
+def train_model():
+    """Train the CarbonWatch model using data from Supabase"""
+    global tf
+    
+    try:
+        # Import TensorFlow if not already loaded
+        if tf is None:
+            try:
+                import importlib
+                tf = importlib.import_module('tensorflow')
+                # Set TensorFlow log level
+                os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+            except Exception as e:
+                return jsonify({'error': 'TensorFlow not available', 'details': str(e)}), 500
+        
+        # Load and clean data from Supabase
+        try:
+            cleaned_df = load_and_clean_data_from_supabase()
+        except Exception as e:
+            return jsonify({'error': 'Failed to load data from Supabase', 'details': str(e)}), 500
+        
+        print(f"Dataset loaded with shape: {cleaned_df.shape}")
+        print(f"Label distribution:\n{cleaned_df['Label'].value_counts()}")
+        
+        # Preprocess data
+        try:
+            X, y, preprocessor, label_encoder = preprocess_training_data(cleaned_df)
+        except Exception as e:
+            return jsonify({'error': 'Data preprocessing failed', 'details': str(e)}), 500
+        
+        print(f"Features shape: {X.shape}")
+        print(f"Labels shape: {y.shape}")
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        print(f"Training set - Features: {X_train.shape}, Labels: {y_train.shape}")
+        print(f"Testing set - Features: {X_test.shape}, Labels: {y_test.shape}")
+        
+        # Apply preprocessing
+        X_train_processed = preprocessor.fit_transform(X_train)
+        X_test_processed = preprocessor.transform(X_test)
+        
+        print(f"Processed training features shape: {X_train_processed.shape}")
+        input_dim = X_train_processed.shape[1]
+        
+        # Build model
+        model = build_training_model(input_dim)
+        
+        # Setup early stopping
+        early_stopping = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=10, restore_best_weights=True
+        )
+        
+        # Train model
+        print("\n--- Starting model training ---")
+        history = model.fit(
+            X_train_processed, y_train,
+            epochs=100,
+            batch_size=32,
+            validation_split=0.2,
+            callbacks=[early_stopping],
+            verbose=1
+        )
+        print("--- Training completed ---")
+        
+        # Evaluate model
+        print("\n--- Evaluating model ---")
+        loss, accuracy = model.evaluate(X_test_processed, y_test, verbose=0)
+        
+        # Make predictions for detailed evaluation
+        predictions = model.predict(X_test_processed)
+        predicted_classes = np.argmax(predictions, axis=1)
+        true_classes = np.argmax(y_test, axis=1)
+        
+        # Calculate per-class accuracy
+        from sklearn.metrics import classification_report, confusion_matrix
+        
+        report = classification_report(
+            true_classes, predicted_classes, 
+            target_names=label_encoder.classes_, 
+            output_dict=True
+        )
+        
+        cm = confusion_matrix(true_classes, predicted_classes)
+        
+        # Save model and preprocessors
+        try:
+            # Save locally first
+            model.save(MODEL_PATH)
+            
+            with open(PREPROCESSOR_PATH, 'wb') as f:
+                pickle.dump(preprocessor, f)
+            
+            with open(LABEL_ENCODER_PATH, 'wb') as f:
+                pickle.dump(label_encoder, f)
+            
+            print(f"Model saved locally to {MODEL_PATH}")
+            print(f"Preprocessor saved locally to {PREPROCESSOR_PATH}")
+            print(f"Label encoder saved locally to {LABEL_ENCODER_PATH}")
+            
+            # Upload to cloud storage if not in local mode
+            cloud_paths = {}
+            if not LOCAL_MODE:
+                try:
+                    cloud_paths = upload_artifacts_to_cloud()
+                    print("✅ Artifacts successfully uploaded to cloud storage")
+                    
+                    # Optional: Clean up local files after successful cloud upload
+                    # Uncomment the line below if you want to remove local files after upload
+                    # cleanup_local_artifacts()
+                    
+                except Exception as e:
+                    print(f"⚠️ Warning: Failed to upload to cloud storage: {e}")
+                    # Continue execution - local files are still available
+            
+            # Update global artifacts to use the new model
+            artifacts['model'] = model
+            artifacts['preprocessor'] = preprocessor
+            artifacts['label_encoder'] = label_encoder
+            artifacts['loaded'] = True
+            
+        except Exception as e:
+            return jsonify({'error': 'Failed to save model artifacts', 'details': str(e)}), 500
+        
+        # Prepare training summary
+        training_epochs = len(history.history['accuracy'])
+        final_train_acc = history.history['accuracy'][-1]
+        final_val_acc = history.history['val_accuracy'][-1]
+        final_train_loss = history.history['loss'][-1]
+        final_val_loss = history.history['val_loss'][-1]
+        
+        # Check for overfitting
+        acc_diff = abs(final_train_acc - final_val_acc)
+        loss_diff = abs(final_val_loss - final_train_loss)
+        overfitting_detected = acc_diff > 0.05 or loss_diff > 0.1
+        
+        response_data = {
+            'status': 'success',
+            'message': 'Model training completed successfully',
+            'training_info': {
+                'total_samples': len(cleaned_df),
+                'training_samples': len(X_train),
+                'test_samples': len(X_test),
+                'features': list(X.columns),
+                'target_classes': label_encoder.classes_.tolist(),
+                'training_epochs': training_epochs,
+                'input_dimensions': input_dim
+            },
+            'performance_metrics': {
+                'test_accuracy': float(accuracy),
+                'test_loss': float(loss),
+                'training_accuracy': float(final_train_acc),
+                'validation_accuracy': float(final_val_acc),
+                'training_loss': float(final_train_loss),
+                'validation_loss': float(final_val_loss),
+                'overfitting_detected': overfitting_detected
+            },
+            'classification_report': report,
+            'confusion_matrix': cm.tolist(),
+            'label_distribution': cleaned_df['Label'].value_counts().to_dict(),
+            'model_artifacts': {
+                'local_paths': {
+                    'model_path': MODEL_PATH,
+                    'preprocessor_path': PREPROCESSOR_PATH,
+                    'label_encoder_path': LABEL_ENCODER_PATH
+                },
+                'cloud_paths': cloud_paths if not LOCAL_MODE else {},
+                'storage_mode': 'local' if LOCAL_MODE else 'cloud'
+            }
+        }
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        app.logger.exception('Training error: %s', e)
+        return jsonify({'error': 'Training failed', 'details': str(e)}), 500
 
 
 @app.route('/', methods=['GET'])
