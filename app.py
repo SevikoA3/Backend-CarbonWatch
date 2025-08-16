@@ -1025,20 +1025,12 @@ def predict():
                 feature_importance  # Pass SHAP values
             )
             
-            # Prepare prediction data for Gemini
+            # Prepare prediction data
             prediction_data = {
                 'label': str(labels[i]),
                 'confidence': float(confidences[i]),
                 'transaction_id': records[i].get('id', f'TRP{20250000 + i + 1}')
             }
-            
-            # Generate AI explanation using Gemini
-            ai_explanation = generate_gemini_explanation(
-                prediction_data, 
-                reasons, 
-                feature_importance,
-                input_data=records[i]  # Pass all input data
-            )
             
             result = {
                 'label': prediction_data['label'],
@@ -1046,7 +1038,6 @@ def predict():
                 'probabilities': [float(x) for x in preds[i].tolist()],
                 'transaction_id': prediction_data['transaction_id'],
                 'explanation': {
-                    'ai_summary': ai_explanation,
                     'technical_reasons': reasons,
                     'feature_importance': feature_importance if feature_importance else {},
                 }
@@ -1058,6 +1049,61 @@ def predict():
     except Exception as e:
         app.logger.exception('Prediction error: %s', e)
         return jsonify({'error': 'Prediction failed', 'details': str(e)}), 500
+
+
+@app.route('/ai_summary', methods=['POST'])
+def ai_summary():
+    """AI Summary endpoint. Accepts prediction data and provides natural language explanation using Gemini AI."""
+    try:
+        if not artifacts['loaded']:
+            load_artifacts()
+        if not artifacts['loaded']:
+            return jsonify({'error': 'Model artifacts are missing on server. Check logs.'}), 500
+
+        data = request.get_json(force=True)
+        
+        # Validate required fields
+        required_fields = ['label', 'confidence', 'technical_reasons']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+        
+        # Prepare prediction data
+        prediction_data = {
+            'label': data['label'],
+            'confidence': data['confidence'],
+            'transaction_id': data.get('transaction_id', 'Unknown')
+        }
+        
+        # Get technical reasons
+        reasons = data['technical_reasons']
+        if not isinstance(reasons, list):
+            return jsonify({'error': 'technical_reasons must be a list'}), 400
+        
+        # Get feature importance (optional)
+        feature_importance = data.get('feature_importance', {})
+        
+        # Get input data (optional)
+        input_data = data.get('input_data', {})
+        
+        # Generate AI explanation using Gemini
+        ai_explanation = generate_gemini_explanation(
+            prediction_data, 
+            reasons, 
+            feature_importance,
+            input_data=input_data
+        )
+        
+        result = {
+            'transaction_id': prediction_data['transaction_id'],
+            'ai_summary': ai_explanation
+        }
+        
+        return jsonify(result)
+
+    except Exception as e:
+        app.logger.exception('AI Summary error: %s', e)
+        return jsonify({'error': 'AI Summary failed', 'details': str(e)}), 500
 
 
 if __name__ == '__main__':
