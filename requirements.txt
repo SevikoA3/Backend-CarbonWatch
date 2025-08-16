@@ -9,7 +9,3 @@ google-cloud-storage
 shap
 python-dotenv
 google-genai
-supabase
-psycopg2-binary
-matplotlib
-seaborn
