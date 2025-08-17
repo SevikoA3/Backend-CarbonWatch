@@ -12,3 +12,4 @@ supabase
 psycopg2-binary
 matplotlib
 seaborn
+Flask-Cors

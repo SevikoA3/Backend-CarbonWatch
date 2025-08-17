@@ -3,6 +3,7 @@ import pickle
 import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from urllib.parse import urlparse
 import gc
 from supabase import create_client, Client
@@ -46,6 +47,9 @@ except Exception:
     storage = None
 
 app = Flask(__name__)
+
+# Enable CORS for all origins
+CORS(app, origins='*')
 
 # Environment configuration
 LOCAL_MODE = os.environ.get('LOCAL', 'true').lower() == 'true'
