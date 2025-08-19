@@ -655,14 +655,23 @@ Tingkat Keyakinan: {confidence:.2%}"""
         
         prompt += """
 Tugas Anda:
-1. Jelaskan hasil prediksi dengan bahasa yang mudah dipahami
-2. Berikan rekomendasi tindakan yang jelas
-3. Sebutkan tingkat risiko dan alasannya
-4. Gunakan maksimal 3-4 kalimat yang informatif
-5. Jawaban tidak perlu menggunakan formatting seperti bold, italic, dan lain-lain
-6. Tuliskan penjelasan tanpa menggunakan kata ganti orang pertama (mis. "kami", "saya")
+Berikan penjelasan dengan format yang TEPAT seperti contoh berikut:
 
-Format jawaban dalam bahasa Indonesia yang profesional dan tidak bertele-tele tapi mudah dipahami.
+Alasan Peringatan AI:
+
+1. Transaksi Dilakukan di Luar Jam Normal:
+• Transaksi ini dilakukan pada waktu yang tidak biasa, yaitu pada pukul 23:32:00, di luar jam transaksi yang biasa terjadi (08:00 - 18:00).
+• Model AI mempelajari pola waktu transaksi sebelumnya dan menandai aktivitas ini sebagai mencurigakan karena tidak sesuai dengan profil jam operasi perusahaan.
+
+2. Volume Transaksi Tidak Proporsional dengan Profil Industri:
+• Volume karbon yang terlibat (75.000 ton) jauh lebih besar dibandingkan transaksi karbon lainnya dalam sektor ini, yang rata-rata hanya berkisar antara 10.000 hingga 30.000 ton per transaksi.
+• AI menggunakan dataset historis dan perbandingan dengan industri serupa untuk menandai transaksi ini sebagai outlier yang patut diperiksa lebih lanjut.
+
+Tindakan yang Diambil oleh AI:
+• Skor Risiko: 85% - Transaksi mencurigakan dengan probabilitas tinggi terjadinya kecurangan atau pencucian uang.
+• Rekomendasi Tindakan: Diperlukan tinjauan manual oleh analis untuk menentukan validitas transaksi.
+
+PENTING: Ikuti format PERSIS seperti contoh ini. Gunakan bullet points (•) dan numbering (1., 2.) sesuai struktur yang diberikan.
 """
         
         # Call Gemini API
